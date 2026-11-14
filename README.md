@@ -160,3 +160,4 @@ every Windows 10/11 build, firmware sensor, GPU driver, or media player.
 ## License
 
 Dave is licensed under the [MIT License](./LICENSE).
+## Dave's programming featured AI help.
