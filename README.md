@@ -75,7 +75,13 @@ Dave does not draw its own FPS counter.
 
 ## Windows
 
-Windows builds use the MSYS2 UCRT64 toolchain and GTK4 runtime.
+Dave targets 64-bit Windows 10 version 1809 or later and Windows 11. Windows
+10 22H2 or later is recommended. The media-session API used for track details
+is available starting in Windows 10 version 1809.
+
+Windows builds use the MSYS2 UCRT64 toolchain and GTK4 runtime. Install MSYS2
+at its default location (`C:\msys64`) or set `MSYS2_ROOT` before running the
+installer.
 
 1. Install [MSYS2](https://www.msys2.org/).
 2. Open the **MSYS2 UCRT64** terminal and install the build tools:
@@ -98,10 +104,24 @@ Windows builds use the MSYS2 UCRT64 toolchain and GTK4 runtime.
    ```
 
 The installer creates Start menu and sign-in shortcuts. Launch Dave from the
-Start menu. Its Windows backend supports CPU utilization, NVIDIA GPU telemetry
-when `nvidia-smi.exe` is on `PATH`, Steam process detection, global hotkeys,
-and system-wide media keys. Windows media metadata and CPU temperature are
-not currently available. For an in-game FPS display, use RTSS/Afterburner.
+Start menu. Its Windows backend reads CPU usage and media title/playback state
+from the native Windows media-session API, and uses Windows media keys for
+previous, play/pause, and next controls. It does not need Python, PyWinRT, or a
+third-party media service.
+
+GPU utilization prefers `nvidia-smi.exe` on NVIDIA systems. If that is
+unavailable, Dave reads Windows GPU-engine performance counters, which need a
+WDDM 2.0-or-later graphics driver. This fallback reports the busiest GPU
+engine, not a sum of all engines. The media buttons send global Windows media
+keys, so they can still work when a player does not expose session metadata.
+GPU temperature is available only through `nvidia-smi`; Windows CPU
+temperature is not currently supported. Windows Steam game detection, Alt+R,
+and Ctrl+] are also supported. For an in-game FPS display, use
+RTSS/Afterburner.
+
+The Windows app is a desktop overlay, not a game-injected overlay. Games using
+exclusive full-screen mode may cover it; borderless-windowed mode is the
+recommended setup.
 
 ## Behavior and limitations
 
@@ -109,9 +129,10 @@ not currently available. For an in-game FPS display, use RTSS/Afterburner.
 |---|---|---|
 | CPU utilization | Yes | Yes |
 | CPU temperature | Supported `hwmon` sensors | Not available |
-| GPU utilization and temperature | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe` |
-| Track title and playback state | MPRIS through `playerctl` | Not currently available |
-| Media controls | `playerctl` | System-wide media keys |
+| GPU utilization | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe` or Windows GPU-engine counters |
+| GPU temperature | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe` |
+| Track title and playback state | MPRIS through `playerctl` | Windows media-session API (Windows 10 1809+) |
+| Media controls | `playerctl` | Global Windows media keys |
 | Game detection | Steam app environment | Steam install-path process detection |
 | In-game FPS | MangoHud | RTSS/Afterburner |
 | Click-through outside media buttons | Supported layer-shell sessions | Not implemented |
@@ -143,9 +164,10 @@ cargo build --locked --release
 ```
 
 GitHub Actions runs formatting, tests, lint, and a release build on Linux, plus
-tests, a release build, and installer syntax validation on Windows. A green
-build confirms compilation, not runtime testing on every desktop, driver, or
-Windows configuration.
+formatting, tests, release builds, and installer syntax validation on Windows
+Server 2022 and 2025 runners. A green build confirms compilation, not runtime
+testing on Windows 10, every GPU driver, or every media player. Windows 10 and
+Windows 11 runtime behavior still needs testing on those systems.
 
 ## License
 

@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::{
     cell::{Cell, RefCell},
     io,
@@ -35,9 +37,23 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use sysinfo::{ProcessesToUpdate, System};
 #[cfg(target_os = "windows")]
 use windows::{
+    Media::Control::{
+        GlobalSystemMediaTransportControlsSession,
+        GlobalSystemMediaTransportControlsSessionManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    },
     Win32::{
         Foundation::{FILETIME, HWND, RECT},
-        System::Threading::GetSystemTimes,
+        System::{
+            Performance::{
+                PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA,
+                PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+                PDH_MORE_DATA, PDH_NO_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+                PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+            },
+            Threading::GetSystemTimes,
+            WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
+        },
         UI::{
             Input::KeyboardAndMouse::{
                 INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -192,6 +208,154 @@ struct GpuTelemetry {
     temperature: Option<i32>,
 }
 
+#[cfg(target_os = "windows")]
+struct WindowsGpuSampler {
+    query: PDH_HQUERY,
+    counter: PDH_HCOUNTER,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsGpuSampler {
+    fn new() -> Result<Self, String> {
+        let mut query = PDH_HQUERY::default();
+        let status = unsafe { PdhOpenQueryW(windows::core::PCWSTR::null(), 0, &mut query) };
+        if status != 0 {
+            return Err(format!(
+                "Could not open Windows GPU counter query (0x{status:08x})"
+            ));
+        }
+
+        let mut counter = PDH_HCOUNTER::default();
+        let status = unsafe {
+            PdhAddEnglishCounterW(
+                query,
+                w!("\\GPU Engine(*)\\Utilization Percentage"),
+                0,
+                &mut counter,
+            )
+        };
+        if status != 0 {
+            unsafe {
+                PdhCloseQuery(query);
+            }
+            return Err(format!(
+                "Windows GPU utilization counters are unavailable (0x{status:08x})"
+            ));
+        }
+
+        let status = unsafe { PdhCollectQueryData(query) };
+        if status != 0 {
+            unsafe {
+                PdhCloseQuery(query);
+            }
+            return Err(format!(
+                "Could not initialize Windows GPU utilization counters (0x{status:08x})"
+            ));
+        }
+
+        Ok(Self { query, counter })
+    }
+
+    fn sample(&mut self) -> Result<Option<GpuTelemetry>, String> {
+        let status = unsafe { PdhCollectQueryData(self.query) };
+        if status == PDH_NO_DATA || status == PDH_CSTATUS_NO_INSTANCE {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(format!(
+                "Could not read Windows GPU utilization counters (0x{status:08x})"
+            ));
+        }
+
+        let mut buffer_size = 0u32;
+        let mut item_count = 0u32;
+        let mut status = unsafe {
+            PdhGetFormattedCounterArrayW(
+                self.counter,
+                PDH_FMT_DOUBLE,
+                &mut buffer_size,
+                &mut item_count,
+                None,
+            )
+        };
+        if status == PDH_CSTATUS_NO_INSTANCE || status == PDH_NO_DATA {
+            return Ok(None);
+        }
+        if status != PDH_MORE_DATA && status != 0 {
+            return Err(format!(
+                "Could not enumerate Windows GPU utilization counters (0x{status:08x})"
+            ));
+        }
+
+        for _ in 0..3 {
+            if item_count == 0 || buffer_size == 0 {
+                return Ok(None);
+            }
+            let words = (buffer_size as usize).div_ceil(std::mem::size_of::<u64>());
+            let mut buffer = vec![0u64; words];
+            status = unsafe {
+                PdhGetFormattedCounterArrayW(
+                    self.counter,
+                    PDH_FMT_DOUBLE,
+                    &mut buffer_size,
+                    &mut item_count,
+                    Some(buffer.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>()),
+                )
+            };
+            if status == PDH_MORE_DATA {
+                continue;
+            }
+            if status != 0 {
+                return Err(format!(
+                    "Could not read Windows GPU utilization counters (0x{status:08x})"
+                ));
+            }
+
+            let items = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.as_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
+                    item_count as usize,
+                )
+            };
+            let utilization = gpu_engine_utilization(items.iter().filter_map(|item| {
+                if item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA
+                    || item.FmtValue.CStatus == PDH_CSTATUS_NEW_DATA
+                {
+                    Some(unsafe { item.FmtValue.Anonymous.doubleValue })
+                } else {
+                    None
+                }
+            }));
+            return Ok(utilization.map(|utilization| GpuTelemetry {
+                utilization: Some(utilization),
+                temperature: None,
+            }));
+        }
+
+        Err(format!(
+            "Windows GPU utilization counter list kept changing"
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsGpuSampler {
+    fn drop(&mut self) {
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn gpu_engine_utilization(values: impl IntoIterator<Item = f64>) -> Option<u8> {
+    values
+        .into_iter()
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        .reduce(f64::max)
+        .map(|value| value.round() as u8)
+}
+
 fn parse_gpu_telemetry(output: &str) -> Option<GpuTelemetry> {
     let mut fields = output.lines().next()?.split(',');
     let utilization = fields
@@ -233,6 +397,34 @@ fn nvidia_telemetry() -> Option<GpuTelemetry> {
     }
 
     parse_gpu_telemetry(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_gpu_monitor(sender: SyncSender<Result<Option<GpuTelemetry>, String>>) {
+    thread::spawn(move || {
+        let (mut sampler, sampler_error) = match WindowsGpuSampler::new() {
+            Ok(sampler) => (Some(sampler), None),
+            Err(error) => (None, Some(error)),
+        };
+
+        loop {
+            let telemetry = if let Some(telemetry) = nvidia_telemetry() {
+                Ok(Some(telemetry))
+            } else if let Some(sampler) = sampler.as_mut() {
+                sampler.sample()
+            } else {
+                Err(sampler_error
+                    .clone()
+                    .unwrap_or_else(|| "Windows GPU telemetry is unavailable".to_owned()))
+            };
+
+            match sender.try_send(telemetry) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+            thread::sleep(GPU_CHECK_INTERVAL);
+        }
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -288,15 +480,9 @@ fn sysfs_gpu_telemetry() -> Option<GpuTelemetry> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn gpu_telemetry() -> Option<GpuTelemetry> {
-    #[cfg(target_os = "linux")]
-    {
-        nvidia_telemetry().or_else(sysfs_gpu_telemetry)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        nvidia_telemetry()
-    }
+    nvidia_telemetry().or_else(sysfs_gpu_telemetry)
 }
 
 #[cfg(target_os = "linux")]
@@ -512,8 +698,102 @@ fn player_status(player: &str) -> Option<bool> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_media() -> Result<Option<MediaInfo>, String> {
-    Ok(None)
+fn windows_media_snapshot(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+) -> Result<Option<MediaInfo>, String> {
+    let sessions = manager
+        .GetSessions()
+        .map_err(|error| format!("Could not list Windows media sessions: {error}"))?;
+    if sessions
+        .Size()
+        .map_err(|error| format!("Could not count Windows media sessions: {error}"))?
+        == 0
+    {
+        return Ok(None);
+    }
+
+    let session = manager
+        .GetCurrentSession()
+        .map_err(|error| format!("Could not get the active Windows media session: {error}"))?;
+    let playback_status = session
+        .GetPlaybackInfo()
+        .and_then(|info| info.PlaybackStatus())
+        .map_err(|error| format!("Could not read Windows media playback status: {error}"))?;
+    let playing =
+        playback_status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+    if !playing
+        && playback_status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused
+    {
+        return Ok(None);
+    }
+
+    let properties = session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|operation| operation.get())
+        .map_err(|error| format!("Could not read Windows media metadata: {error}"))?;
+    let title = properties
+        .Title()
+        .map_err(|error| format!("Could not read Windows media title: {error}"))?
+        .to_string();
+    let artist = properties
+        .Artist()
+        .map_err(|error| format!("Could not read Windows media artist: {error}"))?
+        .to_string();
+
+    Ok(Some(MediaInfo {
+        player: "windows-media-session".to_owned(),
+        title: format_media_title(&artist, &title),
+        playing,
+        art_url: None,
+    }))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn format_media_title(artist: &str, title: &str) -> String {
+    match (artist.trim(), title.trim()) {
+        ("", "") => "Media session active".to_owned(),
+        ("", title) => title.to_owned(),
+        (artist, "") => artist.to_owned(),
+        (artist, title) => format!("{artist} - {title}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_media_monitor(sender: SyncSender<Result<Option<MediaInfo>, String>>) {
+    thread::spawn(move || {
+        if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+            let _ = sender.send(Err(format!(
+                "Could not initialize Windows media integration: {error}"
+            )));
+            return;
+        }
+
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .and_then(|operation| operation.get());
+        let manager = match manager {
+            Ok(manager) => manager,
+            Err(error) => {
+                let _ = sender.send(Err(format!(
+                    "Windows media metadata is unavailable: {error}"
+                )));
+                unsafe {
+                    RoUninitialize();
+                }
+                return;
+            }
+        };
+
+        loop {
+            match sender.try_send(windows_media_snapshot(&manager)) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+            thread::sleep(MEDIA_CHECK_INTERVAL);
+        }
+        unsafe {
+            RoUninitialize();
+        }
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -1141,12 +1421,7 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
     let track_row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     let music_icon = gtk::Label::new(Some("🎧"));
     music_icon.add_css_class("music-icon");
-    let initial_track = if cfg!(target_os = "windows") {
-        "Media controls ready"
-    } else {
-        "No media playing"
-    };
-    let track = gtk::Label::new(Some(initial_track));
+    let track = gtk::Label::new(Some("No media playing"));
     track.set_xalign(0.0);
     track.set_ellipsize(pango::EllipsizeMode::End);
     track.set_width_chars(12);
@@ -1187,6 +1462,14 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
     connect_media_button(&next_button, &active_player, "next", || {});
 
     let (sender, receiver) = mpsc::channel();
+    #[cfg(target_os = "windows")]
+    let (windows_media_sender, windows_media_receiver) = mpsc::sync_channel(1);
+    #[cfg(target_os = "windows")]
+    start_windows_media_monitor(windows_media_sender);
+    #[cfg(target_os = "windows")]
+    let (windows_gpu_sender, windows_gpu_receiver) = mpsc::sync_channel(1);
+    #[cfg(target_os = "windows")]
+    start_windows_gpu_monitor(windows_gpu_sender);
     #[cfg(target_os = "linux")]
     let parent_sender = start_global_shortcuts(sender.clone());
     #[cfg(target_os = "windows")]
@@ -1262,12 +1545,16 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
     let cpu = Rc::new(RefCell::new(CpuSampler::default()));
     let shortcut_error = Rc::new(RefCell::new(None::<String>));
     let shortcut_error_ref = shortcut_error.clone();
+    #[cfg(target_os = "windows")]
+    let mut gpu_status = None::<String>;
     let mut manual_visibility = if background_mode { None } else { Some(true) };
     let mut game_running = false;
     let mut media_active = false;
     let mut media_playing = false;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut retained_media_info = None::<MediaInfo>;
+    #[cfg(target_os = "windows")]
+    let mut windows_media_info = None::<MediaInfo>;
     let mut game_elapsed = GAME_CHECK_INTERVAL;
     let mut media_elapsed = MEDIA_CHECK_INTERVAL;
     let mut gpu_elapsed = GPU_CHECK_INTERVAL;
@@ -1289,11 +1576,11 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
         let mut media_info = None;
         if media_elapsed >= MEDIA_CHECK_INTERVAL {
             media_elapsed = Duration::ZERO;
-            match current_media() {
-                Ok(media) => {
-                    if let Some(media) = media {
-                        #[cfg(target_os = "linux")]
-                        {
+            #[cfg(target_os = "linux")]
+            {
+                match current_media() {
+                    Ok(media) => {
+                        if let Some(media) = media {
                             let artwork_url = media
                                 .player
                                 .to_ascii_lowercase()
@@ -1315,28 +1602,33 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
                                     let _ = sender.send((url, result));
                                 });
                             }
-                        }
-                        media_active = true;
-                        media_playing = media.playing;
-                        #[cfg(target_os = "linux")]
-                        {
-                            retained_media_info = Some(media.clone());
-                        }
-                        *active_player_ref.borrow_mut() = Some(media.player.clone());
-                        media_info = Some(media);
-                    } else if cfg!(target_os = "linux") {
-                        #[cfg(target_os = "linux")]
-                        if paused_media_hold_ref.get() {
+
                             media_active = true;
-                            media_playing = false;
-                            media_info = retained_media_info.clone();
+                            media_playing = media.playing;
+                            retained_media_info = Some(media.clone());
+                            *active_player_ref.borrow_mut() = Some(media.player.clone());
+                            media_info = Some(media);
                         } else {
-                            let active_player = active_player_ref.borrow().clone();
-                            if let Some(player) = active_player {
-                                if let Some(playing) = player_status(&player) {
-                                    media_active = true;
-                                    media_playing = playing;
-                                    media_info = retained_media_info.clone();
+                            if paused_media_hold_ref.get() {
+                                media_active = true;
+                                media_playing = false;
+                                media_info = retained_media_info.clone();
+                            } else {
+                                let active_player = active_player_ref.borrow().clone();
+                                if let Some(player) = active_player {
+                                    if let Some(playing) = player_status(&player) {
+                                        media_active = true;
+                                        media_playing = playing;
+                                        media_info = retained_media_info.clone();
+                                    } else {
+                                        current_art_url = None;
+                                        requested_art_url = None;
+                                        retained_media_info = None;
+                                        set_spotify_theme(&spotify_theme_ref, &panel_ref, None);
+                                        media_active = false;
+                                        media_playing = false;
+                                        *active_player_ref.borrow_mut() = None;
+                                    }
                                 } else {
                                     current_art_url = None;
                                     requested_art_url = None;
@@ -1344,39 +1636,65 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
                                     set_spotify_theme(&spotify_theme_ref, &panel_ref, None);
                                     media_active = false;
                                     media_playing = false;
-                                    *active_player_ref.borrow_mut() = None;
                                 }
-                            } else {
-                                current_art_url = None;
-                                requested_art_url = None;
-                                retained_media_info = None;
-                                set_spotify_theme(&spotify_theme_ref, &panel_ref, None);
-                                media_active = false;
-                                media_playing = false;
                             }
                         }
+                        last_media_error = None;
                     }
-                    last_media_error = None;
-                }
-                Err(error) => {
-                    #[cfg(target_os = "linux")]
-                    {
+                    Err(error) => {
                         if active_player_ref.borrow().is_none() {
                             current_art_url = None;
                             requested_art_url = None;
                             retained_media_info = None;
                             set_spotify_theme(&spotify_theme_ref, &panel_ref, None);
                         }
+                        if active_player_ref.borrow().is_none() {
+                            media_active = false;
+                        }
+                        media_playing = false;
+                        if last_media_error.as_ref() != Some(&error) {
+                            eprintln!("{error}");
+                        }
+                        last_media_error = Some(error.clone());
+                        update_label(&track_ref, &error);
                     }
-                    if active_player_ref.borrow().is_none() {
-                        media_active = false;
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                while let Ok(update) = windows_media_receiver.try_recv() {
+                    match update {
+                        Ok(media) => {
+                            windows_media_info = media;
+                            last_media_error = None;
+                        }
+                        Err(error) => {
+                            if last_media_error.as_ref() != Some(&error) {
+                                eprintln!("{error}");
+                            }
+                            last_media_error = Some(error);
+                        }
                     }
+                }
+
+                if let Some(media) = windows_media_info.clone() {
+                    media_active = true;
+                    media_playing = media.playing;
+                    retained_media_info = Some(media.clone());
+                    *active_player_ref.borrow_mut() = Some(media.player.clone());
+                    media_info = Some(media);
+                } else if paused_media_hold_ref.get() {
+                    media_active = true;
                     media_playing = false;
-                    if last_media_error.as_ref() != Some(&error) {
-                        eprintln!("{error}");
+                    media_info = retained_media_info.clone();
+                } else {
+                    media_active = false;
+                    media_playing = false;
+                    retained_media_info = None;
+                    *active_player_ref.borrow_mut() = Some("windows-media-keys".to_owned());
+                    if last_media_error.is_none() {
+                        update_label(&track_ref, "No media playing");
                     }
-                    last_media_error = Some(error.clone());
-                    update_label(&track_ref, &error);
                 }
             }
         }
@@ -1398,7 +1716,32 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
         gpu_elapsed += REFRESH_INTERVAL;
         if gpu_elapsed >= GPU_CHECK_INTERVAL {
             gpu_elapsed = Duration::ZERO;
-            gpu = gpu_telemetry().unwrap_or_default();
+            #[cfg(target_os = "linux")]
+            {
+                gpu = gpu_telemetry().unwrap_or_default();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                while let Ok(update) = windows_gpu_receiver.try_recv() {
+                    match update {
+                        Ok(Some(telemetry)) => {
+                            gpu = telemetry;
+                            gpu_status = None;
+                        }
+                        Ok(None) => {
+                            gpu = GpuTelemetry::default();
+                            gpu_status = Some(
+                                "Windows has no GPU-engine utilization data for this driver."
+                                    .to_owned(),
+                            );
+                        }
+                        Err(error) => {
+                            gpu = GpuTelemetry::default();
+                            gpu_status = Some(error);
+                        }
+                    }
+                }
+            }
         }
         process_shortcut_actions(
             &receiver,
@@ -1441,6 +1784,8 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
             .unwrap_or_else(|| "--°C".to_owned());
         update_label(&cpu_metric_ref, &format!("CPU {cpu_load} {cpu_temp}"));
         update_label(&gpu_metric_ref, &format!("GPU {gpu_load} {gpu_temp}"));
+        #[cfg(target_os = "windows")]
+        gpu_metric_ref.set_tooltip_text(gpu_status.as_deref());
 
         if shortcut_error.borrow().is_some() {
             update_label(&track_ref, "Shortcuts unavailable");
@@ -1635,6 +1980,22 @@ mod tests {
         let telemetry = parse_gpu_telemetry("101, 48\n").expect("temperature available");
         assert_eq!(telemetry.utilization, None);
         assert_eq!(telemetry.temperature, Some(48));
+    }
+
+    #[test]
+    fn chooses_busiest_valid_gpu_engine() {
+        assert_eq!(super::gpu_engine_utilization([2.4, 45.6, 12.0]), Some(46));
+        assert_eq!(super::gpu_engine_utilization([101.0, f64::NAN]), None);
+    }
+
+    #[test]
+    fn formats_windows_media_metadata_without_empty_separators() {
+        assert_eq!(
+            super::format_media_title("  Artist ", " Track "),
+            "Artist - Track"
+        );
+        assert_eq!(super::format_media_title("", "Track"), "Track");
+        assert_eq!(super::format_media_title("", ""), "Media session active");
     }
 
     #[test]
