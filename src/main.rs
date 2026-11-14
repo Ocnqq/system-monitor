@@ -378,7 +378,14 @@ fn nvidia_telemetry() -> Option<GpuTelemetry> {
     #[cfg(target_os = "windows")]
     let executable = "nvidia-smi.exe";
 
-    let output = Command::new(executable)
+    let mut command = Command::new(executable);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+    }
+
+    let output = command
         .args([
             "--query-gpu=utilization.gpu,temperature.gpu",
             "--format=csv,noheader,nounits",
