@@ -82,13 +82,35 @@ Dave targets 64-bit Windows 10 version 1809 or later and Windows 11. Windows
 10 22H2 or later is recommended. The media-session API used for track details
 is available starting in Windows 10 version 1809.
 
-Build Dave with the 64-bit MSVC Rust toolchain. If building from source, install
-Rust and the Visual Studio C++ build tools, then run in PowerShell:
+To build from source, install Rust with the 64-bit MSVC toolchain and the
+Visual Studio **Desktop development with C++** workload. Download and extract
+the project, then open PowerShell in the extracted project folder (the folder
+containing `Cargo.toml` and `install.ps1`). Do not run these commands from
+`C:\Windows\System32`.
+
+Build first and wait for it to finish successfully:
 
 ```powershell
 cargo build --locked --release
+```
+
+Then install the app:
+
+```powershell
 .\install.ps1
 ```
+
+If PowerShell says that running scripts is disabled, allow scripts only in the
+current PowerShell window and run the installer again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install.ps1
+```
+
+This process-scoped setting resets when the PowerShell window is closed. The
+installer needs the release executable produced by the build, so running it
+before the build succeeds will fail.
 
 The installer copies the standalone executable and creates Start menu and
 sign-in shortcuts. No GTK, MSYS2, Python, PyWinRT, or third-party media service
