@@ -2,14 +2,15 @@
 
 #[cfg(target_os = "windows")]
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::{io, process::Command, sync::mpsc::Sender, thread, time::Duration};
+
+#[cfg(target_os = "linux")]
 use std::{
     cell::{Cell, RefCell},
-    io,
-    process::{Command, Output},
+    process::Output,
     rc::Rc,
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
-    time::Duration,
+    sync::mpsc,
+    sync::mpsc::Receiver,
 };
 
 #[cfg(target_os = "linux")]
@@ -30,6 +31,7 @@ use ashpd::desktop::{
 };
 #[cfg(target_os = "linux")]
 use futures_util::StreamExt;
+#[cfg(target_os = "linux")]
 use gtk::{gdk, glib, pango, prelude::*};
 #[cfg(target_os = "linux")]
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -38,12 +40,11 @@ use sysinfo::{ProcessesToUpdate, System};
 #[cfg(target_os = "windows")]
 use windows::{
     Media::Control::{
-        GlobalSystemMediaTransportControlsSession,
         GlobalSystemMediaTransportControlsSessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     },
     Win32::{
-        Foundation::{FILETIME, HWND, RECT},
+        Foundation::FILETIME,
         System::{
             Performance::{
                 PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA,
@@ -60,14 +61,14 @@ use windows::{
                 MOD_ALT, MOD_CONTROL, RegisterHotKey, SendInput, VIRTUAL_KEY, VK_MEDIA_NEXT_TRACK,
                 VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK, VK_MENU, VK_OEM_6, VK_R,
             },
-            WindowsAndMessaging::{
-                FindWindowW, GetMessageW, GetSystemMetrics, GetWindowRect, HWND_TOPMOST, MSG,
-                SM_CXSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, WM_HOTKEY,
-            },
+            WindowsAndMessaging::{FindWindowW, GetMessageW, MSG, WM_HOTKEY},
         },
     },
     core::w,
 };
+
+#[cfg(target_os = "windows")]
+mod windows_native;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const GPU_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -78,9 +79,11 @@ const MAX_TOGGLE_COMMAND_BYTES: u64 = 16;
 
 #[derive(Clone)]
 struct MediaInfo {
+    #[cfg(target_os = "linux")]
     player: String,
     title: String,
     playing: bool,
+    #[cfg(any(target_os = "linux", test))]
     art_url: Option<String>,
 }
 
@@ -120,16 +123,7 @@ impl CpuSampler {
         let idle = values[3] + values.get(4).copied().unwrap_or_default();
         let total: u64 = values.iter().sum();
         let current = (total, idle);
-        let result = self.previous.map(|(old_total, old_idle)| {
-            let total_delta = total.saturating_sub(old_total);
-            let idle_delta = idle.saturating_sub(old_idle);
-            total_delta
-                .saturating_sub(idle_delta)
-                .saturating_mul(100)
-                .checked_div(total_delta)
-                .unwrap_or_default()
-                .min(100) as u8
-        });
+        let result = calculate_cpu_usage(self.previous, current);
         self.previous = Some(current);
         Ok(result)
     }
@@ -148,19 +142,25 @@ impl CpuSampler {
             |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
         let idle = to_u64(idle);
         let total = to_u64(kernel) + to_u64(user);
-        let result = self.previous.map(|(old_total, old_idle)| {
-            let total_delta = total.saturating_sub(old_total);
-            let idle_delta = idle.saturating_sub(old_idle);
-            total_delta
-                .saturating_sub(idle_delta)
-                .saturating_mul(100)
-                .checked_div(total_delta)
-                .unwrap_or_default()
-                .min(100) as u8
-        });
-        self.previous = Some((total, idle));
+        let current = (total, idle);
+        let result = calculate_cpu_usage(self.previous, current);
+        self.previous = Some(current);
         Ok(result)
     }
+}
+
+fn calculate_cpu_usage(previous: Option<(u64, u64)>, current: (u64, u64)) -> Option<u8> {
+    previous.map(|(old_total, old_idle)| {
+        let (total, idle) = current;
+        let total_delta = total.saturating_sub(old_total);
+        let idle_delta = idle.saturating_sub(old_idle);
+        total_delta
+            .saturating_sub(idle_delta)
+            .saturating_mul(100)
+            .checked_div(total_delta)
+            .unwrap_or_default()
+            .min(100) as u8
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -194,11 +194,6 @@ fn cpu_temperature() -> Option<i32> {
             }
         }
     }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn cpu_temperature() -> Option<i32> {
     None
 }
 
@@ -332,9 +327,7 @@ impl WindowsGpuSampler {
             }));
         }
 
-        Err(format!(
-            "Windows GPU utilization counter list kept changing"
-        ))
+        Err("Windows GPU utilization counter list kept changing".to_owned())
     }
 }
 
@@ -643,6 +636,7 @@ fn current_media() -> Result<Option<MediaInfo>, String> {
     Ok(select_media(&metadata, player_status))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn select_media(
     metadata: &str,
     mut player_status: impl FnMut(&str) -> Option<bool>,
@@ -660,6 +654,7 @@ fn select_media(
 
         let track = track.trim();
         let media = MediaInfo {
+            #[cfg(target_os = "linux")]
             player: player.to_owned(),
             playing,
             art_url: fields
@@ -741,9 +736,11 @@ fn windows_media_snapshot(
         .to_string();
 
     Ok(Some(MediaInfo {
+        #[cfg(target_os = "linux")]
         player: "windows-media-session".to_owned(),
         title: format_media_title(&artist, &title),
         playing,
+        #[cfg(any(target_os = "linux", test))]
         art_url: None,
     }))
 }
@@ -784,9 +781,11 @@ fn start_windows_media_monitor(sender: SyncSender<Result<Option<MediaInfo>, Stri
         };
 
         loop {
-            match sender.try_send(windows_media_snapshot(&manager)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => break,
+            if matches!(
+                sender.try_send(windows_media_snapshot(&manager)),
+                Err(TrySendError::Disconnected(_))
+            ) {
+                break;
             }
             thread::sleep(MEDIA_CHECK_INTERVAL);
         }
@@ -1064,6 +1063,7 @@ fn start_ipc_server(sender: Sender<ShortcutAction>) {
     });
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_success(output: Output, command: &str) -> Result<(), String> {
     if output.status.success() {
         Ok(())
@@ -1193,16 +1193,17 @@ fn start_global_shortcuts(sender: Sender<ShortcutAction>) {
                     2 if skip_registered => Some(ShortcutAction::SkipTrack),
                     _ => None,
                 };
-                if let Some(action) = action {
-                    if sender.send(action).is_err() {
-                        break;
-                    }
+                if let Some(action) = action
+                    && sender.send(action).is_err()
+                {
+                    break;
                 }
             }
         }
     });
 }
 
+#[cfg(target_os = "linux")]
 fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
@@ -1288,6 +1289,7 @@ fn set_spotify_theme(provider: &gtk::CssProvider, panel: &gtk::Box, color: Optio
     panel.add_css_class("spotify-theme");
 }
 
+#[cfg(target_os = "linux")]
 fn build_metric(name: &str) -> gtk::Label {
     let metric = gtk::Label::new(Some(&format!("{name} --% --°C")));
     metric.add_css_class("metric");
@@ -1297,6 +1299,7 @@ fn build_metric(name: &str) -> gtk::Label {
     metric
 }
 
+#[cfg(target_os = "linux")]
 fn media_button(icon: &str, description: &str) -> gtk::Button {
     let button = gtk::Button::from_icon_name(icon);
     button.add_css_class("media-button");
@@ -1305,6 +1308,7 @@ fn media_button(icon: &str, description: &str) -> gtk::Button {
     button
 }
 
+#[cfg(target_os = "linux")]
 fn connect_media_button(
     button: &gtk::Button,
     active_player: &Rc<RefCell<Option<String>>>,
@@ -1325,6 +1329,7 @@ fn connect_media_button(
     });
 }
 
+#[cfg(target_os = "linux")]
 fn update_label(label: &gtk::Label, text: &str) {
     if label.text().as_str() != text {
         label.set_text(text);
@@ -1365,6 +1370,7 @@ fn update_click_through_region(
     surface.set_input_region(Some(&region));
 }
 
+#[cfg(target_os = "linux")]
 fn build_ui(application: &gtk::Application, background_mode: bool) {
     install_css();
     #[cfg(target_os = "linux")]
@@ -1827,6 +1833,7 @@ fn build_ui(application: &gtk::Application, background_mode: bool) {
     window.set_visible(true);
 }
 
+#[cfg(target_os = "linux")]
 fn process_shortcut_actions(
     receiver: &Receiver<ShortcutAction>,
     window: &gtk::ApplicationWindow,
@@ -1859,33 +1866,7 @@ fn process_shortcut_actions(
     }
 }
 
-#[cfg(target_os = "windows")]
-fn position_windows_overlay() {
-    unsafe {
-        let Ok(window) = FindWindowW(None, w!("Dave")) else {
-            return;
-        };
-        if window.is_invalid() {
-            return;
-        }
-
-        let screen_width = GetSystemMetrics(SM_CXSCREEN);
-        let mut rect = RECT::default();
-        let _ = GetWindowRect(window, &mut rect);
-        let width = (rect.right - rect.left).max(220);
-        let height = (rect.bottom - rect.top).max(50);
-        let _ = SetWindowPos(
-            window,
-            Some(HWND_TOPMOST),
-            screen_width - width,
-            0,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn main() {
     let background_mode = std::env::args().any(|argument| argument == "--background");
     if std::env::args().any(|argument| argument == "--toggle") {
@@ -1910,9 +1891,24 @@ fn main() {
     application.run_with_args(&["system-monitor-overlay"]);
 }
 
+#[cfg(target_os = "windows")]
+fn main() {
+    let background_mode = std::env::args().any(|argument| argument == "--background");
+    if std::env::args().any(|argument| argument == "--toggle") {
+        match send_toggle() {
+            Ok(()) => return,
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+    if let Err(error) = windows_native::run(background_mode) {
+        windows_native::show_error(&error);
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{automatic_visibility, parse_gpu_telemetry, select_media};
+    use super::{automatic_visibility, calculate_cpu_usage, parse_gpu_telemetry, select_media};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1944,6 +1940,14 @@ mod tests {
     fn keeps_overlay_visible_while_pause_hold_is_set() {
         assert!(automatic_visibility(false, false, true));
         assert!(!automatic_visibility(false, false, false));
+    }
+
+    #[test]
+    fn computes_cpu_usage_from_total_and_idle_deltas() {
+        assert_eq!(calculate_cpu_usage(None, (100, 50)), None);
+        assert_eq!(calculate_cpu_usage(Some((100, 50)), (200, 100)), Some(50));
+        assert_eq!(calculate_cpu_usage(Some((100, 50)), (200, 150)), Some(0));
+        assert_eq!(calculate_cpu_usage(Some((100, 50)), (100, 50)), Some(0));
     }
 
     #[cfg(target_os = "linux")]

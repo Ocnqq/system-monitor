@@ -7,9 +7,10 @@ platform-specific telemetry and controls.
 ## Features
 
 - CPU utilization on Linux and Windows.
-- GPU utilization and temperature from `nvidia-smi`; Linux also supports
-  compatible DRM/sysfs sensors.
-- CPU temperature from supported Linux `hwmon` sensors.
+- GPU utilization on Windows and Linux; GPU temperature is available through
+  NVIDIA `nvidia-smi` or compatible Linux DRM/sysfs sensors.
+- CPU temperature from supported Linux `hwmon` sensors or Windows firmware/ACPI
+  sensors when exposed.
 - A compact two-row overlay anchored to the top-right on supported desktops.
 - Media title and previous, play/pause, and next controls.
 - Spotify album-art accent color on Linux.
@@ -19,6 +20,8 @@ platform-specific telemetry and controls.
 - **Alt+R** toggles the overlay; **Ctrl+]** skips to the next track.
 - On Linux, only the media buttons capture pointer input; other overlay areas
   pass clicks through.
+- The Windows build uses a native Win32 window and does not require GTK or
+  MSYS2 at runtime.
 
 ## Linux
 
@@ -79,44 +82,30 @@ Dave targets 64-bit Windows 10 version 1809 or later and Windows 11. Windows
 10 22H2 or later is recommended. The media-session API used for track details
 is available starting in Windows 10 version 1809.
 
-Windows builds use the MSYS2 UCRT64 toolchain and GTK4 runtime. Install MSYS2
-at its default location (`C:\msys64`) or set `MSYS2_ROOT` before running the
-installer.
+Build Dave with the 64-bit MSVC Rust toolchain. If building from source, install
+Rust and the Visual Studio C++ build tools, then run in PowerShell:
 
-1. Install [MSYS2](https://www.msys2.org/).
-2. Open the **MSYS2 UCRT64** terminal and install the build tools:
+```powershell
+cargo build --locked --release
+.\install.ps1
+```
 
-   ```sh
-   pacman -S --needed mingw-w64-ucrt-x86_64-gtk4 \
-     mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-rust
-   ```
+The installer copies the standalone executable and creates Start menu and
+sign-in shortcuts. No GTK, MSYS2, Python, PyWinRT, or third-party media service
+is needed at runtime. Dave uses a native Win32 transparent overlay, native
+Windows media-session APIs for track metadata, global media keys for controls,
+`GetSystemTimes` for CPU utilization, and Windows GPU performance counters for
+GPU utilization.
 
-3. In the project directory, build Dave:
-
-   ```sh
-   cargo build --locked --release
-   ```
-
-4. From PowerShell in the same project directory, install Dave:
-
-   ```powershell
-   .\install.ps1
-   ```
-
-The installer creates Start menu and sign-in shortcuts. Launch Dave from the
-Start menu. Its Windows backend reads CPU usage and media title/playback state
-from the native Windows media-session API, and uses Windows media keys for
-previous, play/pause, and next controls. It does not need Python, PyWinRT, or a
-third-party media service.
-
-GPU utilization prefers `nvidia-smi.exe` on NVIDIA systems. If that is
-unavailable, Dave reads Windows GPU-engine performance counters, which need a
-WDDM 2.0-or-later graphics driver. This fallback reports the busiest GPU
-engine, not a sum of all engines. The media buttons send global Windows media
-keys, so they can still work when a player does not expose session metadata.
-GPU temperature is available only through `nvidia-smi`; Windows CPU
-temperature is not currently supported. Windows Steam game detection, Alt+R,
-and Ctrl+] are also supported. For an in-game FPS display, use
+For NVIDIA, Dave prefers `nvidia-smi.exe` for GPU usage and temperature. GPU
+usage falls back to Windows GPU-engine performance counters, which require a
+WDDM 2.0-or-later driver; the fallback reports the busiest engine rather than
+summing engines. CPU temperature is read from the firmware's ACPI thermal
+zones when exposed. Windows does not provide a reliable vendor-independent GPU
+temperature API, so GPU temperature is available through `nvidia-smi.exe` for
+supported NVIDIA drivers and otherwise shows as unavailable. Steam game
+detection, Alt+R, Ctrl+], and click-through outside the
+three media buttons are supported. For an in-game FPS display, use
 RTSS/Afterburner.
 
 The Windows app is a desktop overlay, not a game-injected overlay. Games using
@@ -128,14 +117,14 @@ recommended setup.
 | Capability | Linux | Windows |
 |---|---|---|
 | CPU utilization | Yes | Yes |
-| CPU temperature | Supported `hwmon` sensors | Not available |
+| CPU temperature | Supported `hwmon` sensors | Firmware/ACPI WMI sensor, when exposed |
 | GPU utilization | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe` or Windows GPU-engine counters |
-| GPU temperature | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe` |
+| GPU temperature | NVIDIA `nvidia-smi` or compatible DRM/sysfs | NVIDIA `nvidia-smi.exe`; unavailable for generic drivers |
 | Track title and playback state | MPRIS through `playerctl` | Windows media-session API (Windows 10 1809+) |
 | Media controls | `playerctl` | Global Windows media keys |
 | Game detection | Steam app environment | Steam install-path process detection |
 | In-game FPS | MangoHud | RTSS/Afterburner |
-| Click-through outside media buttons | Supported layer-shell sessions | Not implemented |
+| Click-through outside media buttons | Supported layer-shell sessions | Supported |
 
 Telemetry availability depends on the GPU driver and exposed sensor
 interfaces. Missing sensors are shown as unavailable rather than guessed.
@@ -163,11 +152,10 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --locked --release
 ```
 
-GitHub Actions runs formatting, tests, lint, and a release build on Linux, plus
-formatting, tests, release builds, and installer syntax validation on Windows
-Server 2022 and 2025 runners. A green build confirms compilation, not runtime
-testing on Windows 10, every GPU driver, or every media player. Windows 10 and
-Windows 11 runtime behavior still needs testing on those systems.
+GitHub Actions runs formatting, tests, lint, and release builds on Linux and
+Windows Server 2022/2025. Windows CI compiles and runs the Windows-specific
+unit tests without GTK/MSYS2. A green build does not prove runtime behavior on
+every Windows 10/11 build, firmware sensor, GPU driver, or media player.
 
 ## License
 
