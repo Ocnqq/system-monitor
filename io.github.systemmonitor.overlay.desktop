@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Dave
+Comment=Compact system statistics overlay
+Exec=system-monitor-overlay-launch
+Icon=utilities-system-monitor
+Terminal=false
+StartupWMClass=io.github.systemmonitor.overlay
