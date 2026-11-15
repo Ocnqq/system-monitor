@@ -13,7 +13,6 @@ platform-specific telemetry and controls.
   sensors when exposed.
 - A compact two-row overlay anchored to the top-right on supported desktops.
 - Media title and previous, play/pause, and next controls.
-- Spotify album-art accent color on Linux.
 - Steam-game detection for background startup.
 - An in-game FPS counter through MangoHud on Linux; use RTSS/Afterburner on
   Windows.
